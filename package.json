@@ -9,9 +9,10 @@
     "start:local": "node src/server.js"
   },
   "dependencies": {
-    "ws": "^8.18.3"
+    "ws": "8.18.0"
   },
   "devDependencies": {
     "wrangler": "^4.13.2"
   }
 }
+
