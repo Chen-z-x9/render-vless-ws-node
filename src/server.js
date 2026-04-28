@@ -1,3 +1,4 @@
+
 import http from "node:http";
 import net from "node:net";
 import { WebSocketServer } from "ws";
@@ -95,11 +96,16 @@ async function handleVlessSession(webSocket, expectedUuid) {
 
   await onceConnected(remoteSocket);
 
+  if (webSocket.readyState !== webSocket.OPEN) {
+    remoteSocket.destroy();
+    throw new Error("websocket closed before remote socket was ready");
+  }
+
+  webSocket.send(Buffer.from([parsed.version, 0]));
+
   if (parsed.initialPayload.byteLength > 0) {
     remoteSocket.write(parsed.initialPayload);
   }
-
-  let sentHeader = false;
 
   remoteSocket.on("data", (chunk) => {
     if (!Buffer.isBuffer(chunk) || chunk.length === 0) {
@@ -107,12 +113,6 @@ async function handleVlessSession(webSocket, expectedUuid) {
     }
 
     if (webSocket.readyState !== webSocket.OPEN) {
-      return;
-    }
-
-    if (!sentHeader) {
-      webSocket.send(Buffer.concat([Buffer.from([parsed.version, 0]), chunk]));
-      sentHeader = true;
       return;
     }
 
