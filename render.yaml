@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: render-vless-ws-node
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: VLESS_UUID
+        sync: false
+      - key: WS_PATH
+        value: /ws-tuug99w001ckb21l

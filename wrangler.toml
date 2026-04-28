@@ -1,0 +1,11 @@
+name = "chenzx-vless-worker"
+main = "src/worker.js"
+compatibility_date = "2026-04-27"
+workers_dev = true
+
+[observability]
+enabled = true
+
+[[routes]]
+pattern = "shinecpersonal.qzz.io"
+custom_domain = true
