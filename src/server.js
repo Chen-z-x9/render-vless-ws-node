@@ -1,5 +1,6 @@
 
 import http from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import net from "node:net";
 import { WebSocketServer } from "ws";
 
@@ -7,13 +8,15 @@ const port = Number.parseInt(process.env.PORT || "3000", 10);
 const host = process.env.HOST || "0.0.0.0";
 const uuid = normalizeUuid(process.env.VLESS_UUID);
 const wsPath = normalizePath(process.env.WS_PATH || "/ws");
+const statsConfig = createStatsConfig(process.env);
+const statsTracker = createStatsTracker(statsConfig);
 
 if (!uuid) {
   console.error("VLESS_UUID is missing");
   process.exit(1);
 }
 
-const server = http.createServer((request, response) => {
+const server = http.createServer(async (request, response) => {
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
 
   if (url.pathname === "/") {
@@ -32,6 +35,61 @@ const server = http.createServer((request, response) => {
       )
     );
     return;
+  }
+
+  if (url.pathname === "/stats" || url.pathname === "/stats.json") {
+    if (!statsConfig.enabled) {
+      response.writeHead(404, {
+        "content-type": "text/plain; charset=utf-8"
+      });
+      response.end("Not found");
+      return;
+    }
+
+    if (!statsConfig.authConfigured) {
+      response.writeHead(503, {
+        "content-type": "application/json; charset=utf-8"
+      });
+      response.end(JSON.stringify({ ok: false, error: "stats auth is not configured" }, null, 2));
+      return;
+    }
+
+    if (!isAuthorizedStatsRequest(request, statsConfig)) {
+      response.writeHead(401, {
+        "content-type": "text/plain; charset=utf-8",
+        "www-authenticate": 'Basic realm="traffic-stats"'
+      });
+      response.end("Authentication required");
+      return;
+    }
+
+    try {
+      const snapshot = await statsTracker.getSnapshot();
+
+      if (url.pathname === "/stats.json") {
+        response.writeHead(200, {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store"
+        });
+        response.end(JSON.stringify(snapshot, null, 2));
+        return;
+      }
+
+      response.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store"
+      });
+      response.end(renderStatsPage(snapshot));
+      return;
+    } catch (error) {
+      console.error("stats failed", error);
+      response.writeHead(503, {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store"
+      });
+      response.end(JSON.stringify({ ok: false, error: "failed to read traffic stats" }, null, 2));
+      return;
+    }
   }
 
   response.writeHead(404, {
@@ -56,15 +114,22 @@ server.on("upgrade", (request, socket, head) => {
 });
 
 wsServer.on("connection", (webSocket) => {
-  handleVlessSession(webSocket, uuid).catch((error) => {
+  statsTracker.sessionOpened();
+  handleVlessSession(webSocket, uuid, statsTracker).catch((error) => {
     console.error("session failed", error);
     safeCloseWebSocket(webSocket);
+  }).finally(() => {
+    statsTracker.sessionClosed();
   });
 });
 
 server.listen(port, host, () => {
   console.log(`tailscale-vless-server listening on http://${host}:${port}`);
   console.log(`websocket path: ${wsPath}`);
+  if (statsConfig.enabled) {
+    console.log(`stats path: /stats`);
+    console.log(`stats storage: ${statsConfig.redisConfigured ? "upstash-redis" : "memory-only"}`);
+  }
 });
 
 function normalizeUuid(value) {
@@ -81,7 +146,7 @@ function normalizePath(value) {
   return value.startsWith("/") ? value : `/${value}`;
 }
 
-async function handleVlessSession(webSocket, expectedUuid) {
+async function handleVlessSession(webSocket, expectedUuid, tracker) {
   const firstChunk = await readFirstMessage(webSocket);
   const parsed = parseVlessHeader(firstChunk, expectedUuid);
 
@@ -105,6 +170,7 @@ async function handleVlessSession(webSocket, expectedUuid) {
 
   if (parsed.initialPayload.byteLength > 0) {
     remoteSocket.write(parsed.initialPayload);
+    tracker.recordUplink(parsed.initialPayload.byteLength);
   }
 
   remoteSocket.on("data", (chunk) => {
@@ -117,6 +183,7 @@ async function handleVlessSession(webSocket, expectedUuid) {
     }
 
     webSocket.send(chunk);
+    tracker.recordDownlink(chunk.length);
   });
 
   remoteSocket.on("close", () => {
@@ -136,6 +203,7 @@ async function handleVlessSession(webSocket, expectedUuid) {
     const chunk = normalizeBinary(data);
     if (chunk.length > 0 && !remoteSocket.destroyed) {
       remoteSocket.write(chunk);
+      tracker.recordUplink(chunk.length);
     }
   });
 
@@ -289,6 +357,481 @@ function safeCloseWebSocket(webSocket) {
       webSocket.close();
     }
   } catch {
-    // Ignore close errors.
   }
+}
+
+function createStatsConfig(env) {
+  const enabled = parseBoolean(env.STATS_ENABLED ?? "true");
+  const restUrl = String(env.UPSTASH_REDIS_REST_URL || "").trim().replace(/\/+$/, "");
+  const restToken = String(env.UPSTASH_REDIS_REST_TOKEN || "").trim();
+  const authUser = String(env.STATS_USER || "").trim();
+  const authPass = String(env.STATS_PASS || "").trim();
+  const flushIntervalMs = normalizePositiveInteger(env.STATS_FLUSH_INTERVAL_MS, 5000);
+
+  return {
+    enabled,
+    restUrl,
+    restToken,
+    authUser,
+    authPass,
+    authConfigured: authUser.length > 0 && authPass.length > 0,
+    redisConfigured: restUrl.length > 0 && restToken.length > 0,
+    flushIntervalMs
+  };
+}
+
+function createStatsTracker(config) {
+  const redis = createUpstashRedisClient(config);
+  const state = {
+    pendingUplink: 0,
+    pendingDownlink: 0,
+    inflightUplink: 0,
+    inflightDownlink: 0,
+    memoryTotalUplink: 0,
+    memoryTotalDownlink: 0,
+    memoryMonthId: getCurrentMonthId(),
+    memoryMonthUplink: 0,
+    memoryMonthDownlink: 0,
+    activeSessions: 0,
+    totalSessions: 0,
+    lastFlushAt: null,
+    lastFlushError: "",
+    flushPromise: null
+  };
+
+  const timer =
+    config.enabled && redis.enabled && config.flushIntervalMs > 0
+      ? setInterval(() => {
+          void flush();
+        }, config.flushIntervalMs)
+      : null;
+
+  timer?.unref?.();
+
+  function recordUplink(bytes) {
+    const size = normalizeByteCount(bytes);
+    if (size === 0) {
+      return;
+    }
+    rotateMonthIfNeeded(state);
+    state.pendingUplink += size;
+    state.memoryTotalUplink += size;
+    state.memoryMonthUplink += size;
+  }
+
+  function recordDownlink(bytes) {
+    const size = normalizeByteCount(bytes);
+    if (size === 0) {
+      return;
+    }
+    rotateMonthIfNeeded(state);
+    state.pendingDownlink += size;
+    state.memoryTotalDownlink += size;
+    state.memoryMonthDownlink += size;
+  }
+
+  function sessionOpened() {
+    state.activeSessions += 1;
+    state.totalSessions += 1;
+  }
+
+  function sessionClosed() {
+    state.activeSessions = Math.max(0, state.activeSessions - 1);
+  }
+
+  async function getSnapshot() {
+    rotateMonthIfNeeded(state);
+
+    if (!config.enabled) {
+      return {
+        ok: false,
+        enabled: false
+      };
+    }
+
+    const monthId = getCurrentMonthId();
+    const pendingUplink = state.pendingUplink + state.inflightUplink;
+    const pendingDownlink = state.pendingDownlink + state.inflightDownlink;
+
+    let totalUplink = state.memoryTotalUplink;
+    let totalDownlink = state.memoryTotalDownlink;
+    let monthUplink = monthId === state.memoryMonthId ? state.memoryMonthUplink : 0;
+    let monthDownlink = monthId === state.memoryMonthId ? state.memoryMonthDownlink : 0;
+    let storage = "memory";
+
+    if (redis.enabled) {
+      try {
+        const values = await redis.mget([
+          trafficKey("total", "uplink"),
+          trafficKey("total", "downlink"),
+          trafficKey(monthId, "uplink"),
+          trafficKey(monthId, "downlink")
+        ]);
+
+        totalUplink = values[0] + pendingUplink;
+        totalDownlink = values[1] + pendingDownlink;
+        monthUplink = values[2] + pendingUplink;
+        monthDownlink = values[3] + pendingDownlink;
+        storage = "redis";
+      } catch (error) {
+        state.lastFlushError = error instanceof Error ? error.message : String(error);
+        storage = "memory-fallback";
+      }
+    }
+
+    return {
+      ok: true,
+      service: "tailscale-vless-server",
+      websocketPath: wsPath,
+      month: monthId,
+      storage,
+      redisConfigured: redis.enabled,
+      activeSessions: state.activeSessions,
+      totalSessionsSinceStart: state.totalSessions,
+      pending: {
+        uplink: pendingUplink,
+        downlink: pendingDownlink,
+        total: pendingUplink + pendingDownlink,
+        uplinkHuman: formatBytes(pendingUplink),
+        downlinkHuman: formatBytes(pendingDownlink),
+        totalHuman: formatBytes(pendingUplink + pendingDownlink)
+      },
+      currentMonth: createTrafficBlock(monthUplink, monthDownlink),
+      totals: createTrafficBlock(totalUplink, totalDownlink),
+      lastFlushAt: state.lastFlushAt,
+      lastFlushError: state.lastFlushError || null,
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  async function flush() {
+    rotateMonthIfNeeded(state);
+
+    if (!redis.enabled) {
+      return;
+    }
+
+    if (state.flushPromise) {
+      return state.flushPromise;
+    }
+
+    const monthId = getCurrentMonthId();
+    const deltaUplink = state.pendingUplink;
+    const deltaDownlink = state.pendingDownlink;
+
+    if (deltaUplink === 0 && deltaDownlink === 0) {
+      return;
+    }
+
+    state.pendingUplink = 0;
+    state.pendingDownlink = 0;
+    state.inflightUplink += deltaUplink;
+    state.inflightDownlink += deltaDownlink;
+
+    state.flushPromise = redis
+      .pipeline(
+        [
+          ["INCRBY", trafficKey("total", "uplink"), deltaUplink],
+          ["INCRBY", trafficKey("total", "downlink"), deltaDownlink],
+          ["INCRBY", trafficKey(monthId, "uplink"), deltaUplink],
+          ["INCRBY", trafficKey(monthId, "downlink"), deltaDownlink]
+        ].filter((command) => Number(command[2]) > 0)
+      )
+      .then(() => {
+        state.lastFlushAt = new Date().toISOString();
+        state.lastFlushError = "";
+      })
+      .catch((error) => {
+        state.pendingUplink += deltaUplink;
+        state.pendingDownlink += deltaDownlink;
+        state.lastFlushError = error instanceof Error ? error.message : String(error);
+      })
+      .finally(() => {
+        state.inflightUplink = Math.max(0, state.inflightUplink - deltaUplink);
+        state.inflightDownlink = Math.max(0, state.inflightDownlink - deltaDownlink);
+        state.flushPromise = null;
+      });
+
+    return state.flushPromise;
+  }
+
+  async function close() {
+    if (timer) {
+      clearInterval(timer);
+    }
+    await flush();
+  }
+
+  return {
+    recordUplink,
+    recordDownlink,
+    sessionOpened,
+    sessionClosed,
+    getSnapshot,
+    flush,
+    close
+  };
+}
+
+function createUpstashRedisClient(config) {
+  if (!config.redisConfigured) {
+    return { enabled: false };
+  }
+
+  const headers = {
+    authorization: `Bearer ${config.restToken}`,
+    "content-type": "application/json"
+  };
+
+  async function call(pathname, body) {
+    const response = await fetch(`${config.restUrl}${pathname}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body)
+    });
+
+    const payload = await response.json();
+
+    if (!response.ok) {
+      throw new Error(payload?.error || `Upstash request failed with ${response.status}`);
+    }
+
+    return payload;
+  }
+
+  return {
+    enabled: true,
+    async mget(keys) {
+      const payload = await call("", ["MGET", ...keys]);
+      const values = Array.isArray(payload?.result) ? payload.result : [];
+      return keys.map((_, index) => parseRedisInteger(values[index]));
+    },
+    async pipeline(commands) {
+      if (!Array.isArray(commands) || commands.length === 0) {
+        return [];
+      }
+
+      const payload = await call("/pipeline", commands);
+
+      if (!Array.isArray(payload)) {
+        throw new Error("Unexpected Upstash pipeline response");
+      }
+
+      const firstError = payload.find((item) => item?.error);
+      if (firstError?.error) {
+        throw new Error(firstError.error);
+      }
+
+      return payload;
+    }
+  };
+}
+
+function trafficKey(scope, direction) {
+  if (scope === "total") {
+    return `traffic:total:${direction}`;
+  }
+  return `traffic:month:${scope}:${direction}`;
+}
+
+function createTrafficBlock(uplink, downlink) {
+  const total = uplink + downlink;
+  return {
+    uplink,
+    downlink,
+    total,
+    uplinkHuman: formatBytes(uplink),
+    downlinkHuman: formatBytes(downlink),
+    totalHuman: formatBytes(total)
+  };
+}
+
+function rotateMonthIfNeeded(state) {
+  const monthId = getCurrentMonthId();
+  if (state.memoryMonthId === monthId) {
+    return;
+  }
+
+  state.memoryMonthId = monthId;
+  state.memoryMonthUplink = 0;
+  state.memoryMonthDownlink = 0;
+}
+
+function getCurrentMonthId() {
+  return new Date().toISOString().slice(0, 7);
+}
+
+function normalizePositiveInteger(value, fallback) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function normalizeByteCount(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
+  }
+  return Math.floor(parsed);
+}
+
+function parseBoolean(value) {
+  const normalized = String(value).trim().toLowerCase();
+  return !["0", "false", "no", "off"].includes(normalized);
+}
+
+function parseRedisInteger(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.floor(value);
+  }
+
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return 0;
+}
+
+function isAuthorizedStatsRequest(request, config) {
+  const header = request.headers.authorization || "";
+  if (!header.startsWith("Basic ")) {
+    return false;
+  }
+
+  const encoded = header.slice("Basic ".length).trim();
+
+  let decoded = "";
+  try {
+    decoded = Buffer.from(encoded, "base64").toString("utf8");
+  } catch {
+    return false;
+  }
+
+  const separatorIndex = decoded.indexOf(":");
+  if (separatorIndex < 0) {
+    return false;
+  }
+
+  const user = decoded.slice(0, separatorIndex);
+  const pass = decoded.slice(separatorIndex + 1);
+
+  return secureEquals(user, config.authUser) && secureEquals(pass, config.authPass);
+}
+
+function secureEquals(left, right) {
+  const leftBuffer = Buffer.from(String(left));
+  const rightBuffer = Buffer.from(String(right));
+
+  if (leftBuffer.length !== rightBuffer.length) {
+    return false;
+  }
+
+  return timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function renderStatsPage(snapshot) {
+  const title = "VLESS Traffic Stats";
+  const storageLabel =
+    snapshot.storage === "redis"
+      ? "Upstash Redis"
+      : snapshot.storage === "memory-fallback"
+        ? "Memory fallback"
+        : "Memory only";
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(title)}</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; background: #0b1020; color: #e5e7eb; font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { max-width: 900px; margin: 0 auto; padding: 32px 20px 48px; }
+    h1 { margin: 0 0 8px; font-size: 32px; }
+    p { margin: 0; color: #94a3b8; }
+    .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-top: 24px; }
+    .card { background: #111827; border: 1px solid #1f2937; border-radius: 16px; padding: 18px; }
+    .label { font-size: 13px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.08em; }
+    .value { margin-top: 10px; font-size: 28px; font-weight: 700; color: #f8fafc; }
+    .meta { margin-top: 8px; font-size: 14px; color: #94a3b8; }
+    table { width: 100%; border-collapse: collapse; margin-top: 24px; background: #111827; border-radius: 16px; overflow: hidden; }
+    th, td { padding: 14px 16px; border-bottom: 1px solid #1f2937; text-align: left; }
+    th { width: 180px; color: #94a3b8; font-weight: 600; }
+    tr:last-child th, tr:last-child td { border-bottom: 0; }
+    .warn { color: #fca5a5; }
+    code { color: #bfdbfe; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${escapeHtml(title)}</h1>
+    <p>Month: ${escapeHtml(snapshot.month)} · Storage: ${escapeHtml(storageLabel)}</p>
+    <div class="grid">
+      <section class="card">
+        <div class="label">This Month</div>
+        <div class="value">${escapeHtml(snapshot.currentMonth.totalHuman)}</div>
+        <div class="meta">Up ${escapeHtml(snapshot.currentMonth.uplinkHuman)} · Down ${escapeHtml(snapshot.currentMonth.downlinkHuman)}</div>
+      </section>
+      <section class="card">
+        <div class="label">All Time</div>
+        <div class="value">${escapeHtml(snapshot.totals.totalHuman)}</div>
+        <div class="meta">Up ${escapeHtml(snapshot.totals.uplinkHuman)} · Down ${escapeHtml(snapshot.totals.downlinkHuman)}</div>
+      </section>
+      <section class="card">
+        <div class="label">Pending Flush</div>
+        <div class="value">${escapeHtml(snapshot.pending.totalHuman)}</div>
+        <div class="meta">Up ${escapeHtml(snapshot.pending.uplinkHuman)} · Down ${escapeHtml(snapshot.pending.downlinkHuman)}</div>
+      </section>
+      <section class="card">
+        <div class="label">Sessions</div>
+        <div class="value">${escapeHtml(String(snapshot.activeSessions))}</div>
+        <div class="meta">Started since boot: ${escapeHtml(String(snapshot.totalSessionsSinceStart))}</div>
+      </section>
+    </div>
+    <table>
+      <tr><th>Stats JSON</th><td><code>/stats.json</code></td></tr>
+      <tr><th>WebSocket Path</th><td><code>${escapeHtml(snapshot.websocketPath)}</code></td></tr>
+      <tr><th>Last Flush</th><td>${escapeHtml(snapshot.lastFlushAt || "not flushed yet")}</td></tr>
+      <tr><th>Updated At</th><td>${escapeHtml(snapshot.updatedAt)}</td></tr>
+      <tr><th>Flush Error</th><td class="${snapshot.lastFlushError ? "warn" : ""}">${escapeHtml(snapshot.lastFlushError || "none")}</td></tr>
+    </table>
+  </main>
+</body>
+</html>`;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function formatBytes(bytes) {
+  const size = normalizeByteCount(bytes);
+  if (size === 0) {
+    return "0 B";
+  }
+
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const exponent = Math.min(Math.floor(Math.log(size) / Math.log(1024)), units.length - 1);
+  const value = size / 1024 ** exponent;
+  const digits = value >= 100 || exponent === 0 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${units[exponent]}`;
+}
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    void statsTracker.close().finally(() => {
+      server.close(() => {
+        process.exit(0);
+      });
+      setTimeout(() => process.exit(0), 2000).unref();
+    });
+  });
 }

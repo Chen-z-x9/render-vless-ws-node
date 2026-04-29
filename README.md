@@ -69,6 +69,33 @@ node src/server.js
 - `VLESS_UUID`: `30625464-78e5-4785-a466-5649b8a7b18f`
 - `WS_PATH`: `/ws-tuug99w001ckb21l`
 
+## Koyeb / Render 流量统计
+
+当前 `src/server.js` 已支持服务端流量统计，并暴露两个受保护的接口：
+
+- `/stats`
+- `/stats.json`
+
+要启用持久化统计，需要额外配置以下环境变量：
+
+- `UPSTASH_REDIS_REST_URL`
+- `UPSTASH_REDIS_REST_TOKEN`
+- `STATS_USER`
+- `STATS_PASS`
+
+可选环境变量：
+
+- `STATS_ENABLED=true`
+- `STATS_FLUSH_INTERVAL_MS=5000`
+
+说明：
+
+- `/stats` 返回浏览器可直接查看的 HTML 页面
+- `/stats.json` 返回 JSON
+- 统计的是节点转发的上下行字节数
+- Redis 未配置时，仍可统计，但只保存在内存里，重启后会清零
+- 建议给 Mac 和手机都使用同一个节点，这样总量能在服务端统一统计
+
 更完整的迁移说明见：
 
 `/Users/chenzx/Downloads/Render-海外节点迁移方案.md`
