@@ -10,6 +10,16 @@ const uuid = normalizeUuid(process.env.VLESS_UUID);
 const wsPath = normalizePath(process.env.WS_PATH || "/ws");
 const statsConfig = createStatsConfig(process.env);
 const statsTracker = createStatsTracker(statsConfig);
+const connectTimeoutMs = normalizePositiveInteger(process.env.CONNECT_TIMEOUT_MS, 10000);
+const firstMessageTimeoutMs = normalizePositiveInteger(process.env.FIRST_MESSAGE_TIMEOUT_MS, 10000);
+const maxWebSocketPayloadBytes = normalizePositiveInteger(
+  process.env.MAX_WEBSOCKET_PAYLOAD_BYTES,
+  2 * 1024 * 1024
+);
+const maxPendingUplinkBytes = normalizePositiveInteger(
+  process.env.MAX_PENDING_UPLINK_BYTES,
+  4 * 1024 * 1024
+);
 
 if (!uuid) {
   console.error("VLESS_UUID is missing");
@@ -98,7 +108,11 @@ const server = http.createServer(async (request, response) => {
   response.end("Not found");
 });
 
-const wsServer = new WebSocketServer({ noServer: true });
+const wsServer = new WebSocketServer({
+  noServer: true,
+  perMessageDeflate: false,
+  maxPayload: maxWebSocketPayloadBytes
+});
 
 server.on("upgrade", (request, socket, head) => {
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
@@ -115,11 +129,13 @@ server.on("upgrade", (request, socket, head) => {
 
 wsServer.on("connection", (webSocket) => {
   statsTracker.sessionOpened();
+  webSocket.once("close", () => {
+    statsTracker.sessionClosed();
+  });
+
   handleVlessSession(webSocket, uuid, statsTracker).catch((error) => {
     console.error("session failed", error);
     safeCloseWebSocket(webSocket);
-  }).finally(() => {
-    statsTracker.sessionClosed();
   });
 });
 
@@ -147,7 +163,7 @@ function normalizePath(value) {
 }
 
 async function handleVlessSession(webSocket, expectedUuid, tracker) {
-  const firstChunk = await readFirstMessage(webSocket);
+  const firstChunk = await readFirstMessage(webSocket, firstMessageTimeoutMs);
   const parsed = parseVlessHeader(firstChunk, expectedUuid);
 
   if (parsed.command !== 0x01) {
@@ -158,18 +174,52 @@ async function handleVlessSession(webSocket, expectedUuid, tracker) {
     host: parsed.hostname,
     port: parsed.port
   });
+  remoteSocket.setNoDelay(true);
 
-  await onceConnected(remoteSocket);
+  await onceConnected(remoteSocket, connectTimeoutMs);
 
   if (webSocket.readyState !== webSocket.OPEN) {
     remoteSocket.destroy();
     throw new Error("websocket closed before remote socket was ready");
   }
 
+  let pendingUplinkBytes = 0;
+  let remoteBackpressured = false;
+  const pendingUplink = [];
+
+  const flushPendingUplink = () => {
+    remoteBackpressured = false;
+    while (!remoteSocket.destroyed && pendingUplink.length > 0) {
+      const chunk = pendingUplink.shift();
+      pendingUplinkBytes -= chunk.length;
+      const canContinue = remoteSocket.write(chunk);
+      if (!canContinue) {
+        remoteBackpressured = true;
+        return;
+      }
+    }
+  };
+
+  const writeUplink = (chunk) => {
+    if (!remoteBackpressured && pendingUplink.length === 0) {
+      remoteBackpressured = !remoteSocket.write(chunk);
+      return;
+    }
+
+    pendingUplink.push(chunk);
+    pendingUplinkBytes += chunk.length;
+    if (pendingUplinkBytes > maxPendingUplinkBytes) {
+      remoteSocket.destroy(new Error("uplink buffer limit exceeded"));
+      safeCloseWebSocket(webSocket);
+    }
+  };
+
+  remoteSocket.on("drain", flushPendingUplink);
+
   webSocket.send(Buffer.from([parsed.version, 0]));
 
   if (parsed.initialPayload.byteLength > 0) {
-    remoteSocket.write(parsed.initialPayload);
+    writeUplink(parsed.initialPayload);
     tracker.recordUplink(parsed.initialPayload.byteLength);
   }
 
@@ -179,11 +229,21 @@ async function handleVlessSession(webSocket, expectedUuid, tracker) {
     }
 
     if (webSocket.readyState !== webSocket.OPEN) {
+      remoteSocket.destroy();
       return;
     }
 
-    webSocket.send(chunk);
+    remoteSocket.pause();
     tracker.recordDownlink(chunk.length);
+    webSocket.send(chunk, { binary: true }, (error) => {
+      if (error) {
+        remoteSocket.destroy(error);
+        return;
+      }
+      if (!remoteSocket.destroyed) {
+        remoteSocket.resume();
+      }
+    });
   });
 
   remoteSocket.on("close", () => {
@@ -202,8 +262,8 @@ async function handleVlessSession(webSocket, expectedUuid, tracker) {
 
     const chunk = normalizeBinary(data);
     if (chunk.length > 0 && !remoteSocket.destroyed) {
-      remoteSocket.write(chunk);
       tracker.recordUplink(chunk.length);
+      writeUplink(chunk);
     }
   });
 
@@ -217,8 +277,13 @@ async function handleVlessSession(webSocket, expectedUuid, tracker) {
   });
 }
 
-function readFirstMessage(webSocket) {
+function readFirstMessage(webSocket, timeoutMs) {
   return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("timed out waiting for VLESS header"));
+    }, timeoutMs);
+
     const onMessage = (data, isBinary) => {
       cleanup();
       if (!isBinary) {
@@ -239,6 +304,7 @@ function readFirstMessage(webSocket) {
     };
 
     const cleanup = () => {
+      clearTimeout(timer);
       webSocket.off("message", onMessage);
       webSocket.off("close", onClose);
       webSocket.off("error", onError);
@@ -250,12 +316,18 @@ function readFirstMessage(webSocket) {
   });
 }
 
-function onceConnected(socket) {
+function onceConnected(socket, timeoutMs) {
   return new Promise((resolve, reject) => {
     if (socket.readyState === "open") {
       resolve();
       return;
     }
+
+    const timer = setTimeout(() => {
+      cleanup();
+      socket.destroy();
+      reject(new Error("remote connection timed out"));
+    }, timeoutMs);
 
     const onConnect = () => {
       cleanup();
@@ -268,6 +340,7 @@ function onceConnected(socket) {
     };
 
     const cleanup = () => {
+      clearTimeout(timer);
       socket.off("connect", onConnect);
       socket.off("error", onError);
     };
@@ -303,6 +376,7 @@ function parseVlessHeader(chunk, expectedUuid) {
 
   const optionLength = bytes[17];
   const commandIndex = 18 + optionLength;
+  ensureAvailable(bytes, commandIndex, 4, "VLESS command header");
   const command = bytes[commandIndex];
   const port = (bytes[commandIndex + 1] << 8) | bytes[commandIndex + 2];
   const addressType = bytes[commandIndex + 3];
@@ -311,14 +385,18 @@ function parseVlessHeader(chunk, expectedUuid) {
   let hostname = "";
 
   if (addressType === 0x01) {
+    ensureAvailable(bytes, addressIndex, 4, "IPv4 address");
     hostname = Array.from(bytes.slice(addressIndex, addressIndex + 4)).join(".");
     addressIndex += 4;
   } else if (addressType === 0x02) {
+    ensureAvailable(bytes, addressIndex, 1, "domain length");
     const length = bytes[addressIndex];
     addressIndex += 1;
+    ensureAvailable(bytes, addressIndex, length, "domain address");
     hostname = new TextDecoder().decode(bytes.slice(addressIndex, addressIndex + length));
     addressIndex += length;
   } else if (addressType === 0x03) {
+    ensureAvailable(bytes, addressIndex, 16, "IPv6 address");
     const segments = [];
     for (let index = 0; index < 8; index += 1) {
       const left = bytes[addressIndex + index * 2].toString(16).padStart(2, "0");
@@ -331,6 +409,10 @@ function parseVlessHeader(chunk, expectedUuid) {
     throw new Error(`unsupported address type: ${addressType}`);
   }
 
+  if (!hostname || port === 0) {
+    throw new Error("invalid VLESS target");
+  }
+
   return {
     version,
     command,
@@ -338,6 +420,12 @@ function parseVlessHeader(chunk, expectedUuid) {
     port,
     initialPayload: Buffer.from(bytes.slice(addressIndex))
   };
+}
+
+function ensureAvailable(bytes, start, length, label) {
+  if (start < 0 || length < 0 || start + length > bytes.byteLength) {
+    throw new Error(`invalid ${label}`);
+  }
 }
 
 function bytesToUuid(bytes) {

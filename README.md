@@ -87,6 +87,10 @@ node src/server.js
 
 - `STATS_ENABLED=true`
 - `STATS_FLUSH_INTERVAL_MS=5000`
+- `CONNECT_TIMEOUT_MS=10000`
+- `FIRST_MESSAGE_TIMEOUT_MS=10000`
+- `MAX_WEBSOCKET_PAYLOAD_BYTES=2097152`
+- `MAX_PENDING_UPLINK_BYTES=4194304`
 
 说明：
 
@@ -95,6 +99,7 @@ node src/server.js
 - 统计的是节点转发的上下行字节数
 - Redis 未配置时，仍可统计，但只保存在内存里，重启后会清零
 - 建议给 Mac 和手机都使用同一个节点，这样总量能在服务端统一统计
+- 服务端会限制 WebSocket 单帧和待发送队列，并对目标连接设置超时，避免低内存实例因异常或突发流量失去健康状态
 
 更完整的迁移说明见：
 
